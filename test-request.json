@@ -1,0 +1,11 @@
+{
+  "input": {
+    "prompt": "A cute compact mint green cartoon car on a white background, clean anime cel shading, no text.",
+    "references": [],
+    "width": 1024,
+    "height": 576,
+    "steps": 40,
+    "seed": 8100,
+    "lora_scale": 1.0
+  }
+}

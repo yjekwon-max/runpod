@@ -1,0 +1,126 @@
+"""Single-request GPU worker. No downloads, training, or checkpoint mutation."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import time
+import uuid
+
+START = time.monotonic()
+PIPE = None
+LORA_HASH = None
+
+
+def log(event, **fields):
+    print(json.dumps(dict(event=event, elapsed_s=round(time.monotonic()-START, 3), **fields)), flush=True)
+
+
+def bounded_int(data, key, default, low, high):
+    value = data.get(key, default)
+    if type(value) is not int or not low <= value <= high:
+        raise ValueError(f'{key} must be an integer in [{low}, {high}]')
+    return value
+
+
+def reference_path(name):
+    root = Path('/runpod-volume/references').resolve()
+    path = (root / name).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise ValueError('Reference must be an existing file under references/')
+    return path
+
+
+def validate(data):
+    if not isinstance(data, dict):
+        raise ValueError('input must be an object')
+    if not isinstance(data.get('prompt'), str) or not 1 <= len(data['prompt'].strip()) <= 8000:
+        raise ValueError('prompt is required (maximum 8000 characters)')
+    width = bounded_int(data, 'width', 1024, 256, 1536)
+    height = bounded_int(data, 'height', 576, 256, 1536)
+    if width % 16 or height % 16 or width * height > 1179648:
+        raise ValueError('Dimensions must be multiples of 16 and at most 1179648 pixels')
+    refs = data.get('references', [])
+    if not isinstance(refs, list) or len(refs) > 2 or any(not isinstance(x, str) for x in refs):
+        raise ValueError('references must contain zero to two relative file names')
+    scale = data.get('lora_scale', 1.0)
+    if type(scale) not in (int, float) or not 0 <= scale <= 1.5:
+        raise ValueError('lora_scale must be between 0 and 1.5')
+    return dict(prompt=data['prompt'], width=width, height=height,
+                steps=bounded_int(data, 'steps', 40, 1, 50),
+                seed=bounded_int(data, 'seed', 8100, 0, 2**32-1),
+                references=[reference_path(x) for x in refs], lora_scale=scale)
+
+
+def load_pipeline():
+    global PIPE, LORA_HASH
+    if PIPE is not None:
+        return PIPE
+    import torch
+    from diffusers import QwenImageEditPlusPipeline
+    from safetensors import safe_open
+    model = Path(os.environ['MODEL_DIR'])
+    adapter = Path(os.environ['LORA_PATH'])
+    if not (model / 'model_index.json').is_file() or not adapter.is_file():
+        raise FileNotFoundError('Upload the complete base model and LoRA before requesting inference')
+    expected = os.environ.get('LORA_SHA256', '')
+    with adapter.open('rb') as stream:
+        LORA_HASH = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if not expected or LORA_HASH != expected.lower():
+        raise ValueError('Set LORA_SHA256 to the verified checkpoint SHA256')
+    with safe_open(str(adapter), framework='pt', device='cpu') as f:
+        if not list(f.keys()):
+            raise ValueError('Empty LoRA')
+    log('load_base', gpu=torch.cuda.get_device_name(0))
+    pipe = QwenImageEditPlusPipeline.from_pretrained(str(model), torch_dtype=torch.bfloat16, local_files_only=True)
+    log('load_lora', sha256=LORA_HASH)
+    pipe.load_lora_weights(str(adapter.parent), weight_name=adapter.name, adapter_name='checkpoint')
+    if os.environ.get('OFFLOAD', '1') == '1':
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to('cuda')
+    PIPE = pipe
+    log('pipeline_ready')
+    return pipe
+
+
+def handler(job):
+    t = time.monotonic()
+    args = validate(job.get('input'))
+    import torch
+    from PIL import Image, ImageOps
+    images = []
+    for path in args['references']:
+        with Image.open(path) as im:
+            if im.width * im.height > 16777216:
+                raise ValueError('Reference exceeds 16 megapixels')
+            images.append(ImageOps.exif_transpose(im).convert('RGB'))
+    if not images:
+        images = [Image.new('RGB', (1024, 1024), 'white')]
+    pipe = load_pipeline()
+    pipe.set_adapters('checkpoint', adapter_weights=args['lora_scale'])
+    torch.cuda.reset_peak_memory_stats()
+    log('generate_start', seed=args['seed'], width=args['width'], height=args['height'])
+    with torch.inference_mode():
+        result = pipe(image=images, prompt=args['prompt'], negative_prompt=' ',
+                      width=args['width'], height=args['height'], true_cfg_scale=4.0,
+                      guidance_scale=1.0, num_inference_steps=args['steps'],
+                      generator=torch.Generator(device='cuda').manual_seed(args['seed'])).images[0]
+    torch.cuda.synchronize()
+    out = Path(os.environ.get('OUTPUT_DIR', '/runpod-volume/results')) / uuid.uuid4().hex
+    out.mkdir(parents=True, exist_ok=False)
+    result.save(out / 'image.png')
+    metadata = dict(args, references=[str(x) for x in args['references']],
+                    model='Qwen/Qwen-Image-Edit-2511', lora_sha256=LORA_HASH,
+                    request_seconds=round(time.monotonic()-t, 3),
+                    peak_allocated_GiB=torch.cuda.max_memory_allocated()/2**30,
+                    output_path=str(out / 'image.png'))
+    (out / 'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+    log('saved', **metadata)
+    # Persist results on the volume instead of exceeding the API response size limit.
+    return metadata
+
+
+if __name__ == '__main__':
+    import runpod
+    log('worker_started')
+    runpod.serverless.start({'handler': handler})
