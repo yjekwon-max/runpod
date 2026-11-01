@@ -97,10 +97,13 @@ def handler(job):
     if not images:
         images = [Image.new('RGB', (1024, 1024), 'white')]
     pipe = load_pipeline()
+    log('activate_adapter', lora_scale=args['lora_scale'])
     pipe.set_adapters('checkpoint', adapter_weights=args['lora_scale'])
     torch.cuda.reset_peak_memory_stats()
     log('generate_start', seed=args['seed'], width=args['width'], height=args['height'])
-    with torch.inference_mode():
+    # CPU offload can recreate adapter parameters during generation. Keep them
+    # normal tensors so PEFT can activate the adapter on subsequent requests.
+    with torch.no_grad():
         result = pipe(image=images, prompt=args['prompt'], negative_prompt=' ',
                       width=args['width'], height=args['height'], true_cfg_scale=4.0,
                       guidance_scale=1.0, num_inference_steps=args['steps'],
